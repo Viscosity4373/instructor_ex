@@ -140,49 +140,91 @@ defmodule Instructor.Adapters.Gemini do
   end
 
   defp do_streaming_chat_completion(mode, params, config) do
+    # IO.inspect("Entering do_streaming_chat_completion for mode: #{mode}", label: "Stream Start")
+
     pid = self()
     options = http_options(config)
     {model, params} = Map.pop!(params, :model)
     {_, params} = Map.pop!(params, :stream)
 
-    Stream.resource(
-      fn ->
-        Task.async(fn ->
-          options =
-            Keyword.merge(options,
-              url: url(config) <> "?alt=sse",
-              path_params: [model: model, api_version: api_version(config)],
-              headers: %{"x-goog-api-key" => api_key(config)},
-              json: params,
-              rpc_function: :streamGenerateContent,
-              into: fn {:data, data}, {req, resp} ->
-                send(pid, data)
-                {:cont, {req, resp}}
-              end
-            )
+    # Construct the correct URL directly
+    version = api_version(config)
+    base_url = String.trim_trailing(api_url(config), "/") # Ensure no trailing slash
+    method = :streamGenerateContent
+    # Extract only the model name part (e.g., gemini-2.0-flash-lite)
+    model_name = model |> String.split("/") |> List.last()
+    stream_url = "#{base_url}/#{version}/models/#{model_name}:#{method}?alt=sse"
 
-          Req.merge(gemini_req(), options)
-          |> Req.post!()
+    stream =
+      Stream.resource(
+        fn ->
+          Task.async(fn ->
+            options =
+              Keyword.merge(options,
+                url: stream_url,
+                headers: %{"x-goog-api-key" => api_key(config)},
+                json: params,
+                into: fn {:data, data}, {req, resp} ->
+                  send(pid, data)
+                  {:cont, {req, resp}}
+                end
+              )
 
-          send(pid, :done)
-        end)
-      end,
-      fn task ->
-        receive do
-          :done ->
-            {:halt, task}
+            try do
+              # Use the constructed stream_url directly, remove path_params and rpc_function
+              request_options = 
+                Keyword.merge(options,
+                  # path_params: [model: model, api_version: api_version(config)], # Removed
+                  headers: %{"x-goog-api-key" => api_key(config)},
+                  json: params,
+                  # rpc_function: :streamGenerateContent, # Removed
+                  into: fn {:data, data}, {req, resp} ->
+                    send(pid, data)
+                    {:cont, {req, resp}}
+                  end
+                )
+              
+              request = Req.merge(gemini_req(), request_options)
 
-          data ->
-            {[data], task}
-        after
-          15_000 ->
-            {:halt, task}
-        end
-      end,
-      fn task -> Task.await(task) end
-    )
-    |> SSEStreamParser.parse()
-    |> Stream.map(fn chunk -> parse_stream_chunk_for_mode(mode, chunk) end)
+              # Construct curl command
+              url_string = URI.to_string(request.url)
+              headers_string = Enum.map(request.headers, fn {k, v} -> "-H '#{k}: #{v}'" end) |> Enum.join(" ")
+              json_body = Jason.encode!(request.options[:json])
+              # Escape single quotes in json_body for the curl command
+              escaped_json_body = String.replace(json_body, "'", "''\\'''")
+              curl_command = "curl -X POST '#{url_string}' #{headers_string} -d '#{escaped_json_body}'"
+              # IO.inspect(curl_command, label: "Equivalent curl command")
+
+              response = Req.post!(request)
+              # IO.inspect(response, label: "Req.post! Response in Task:")
+            rescue
+              e -> IO.inspect(e, label: "Req.post! Error in Task:") # Keep this one for actual errors
+            end
+
+            send(pid, :done)
+          end)
+        end,
+        fn task ->
+          receive do
+            :done ->
+              {:halt, task}
+
+            data ->
+              # IO.inspect(data, label: "Raw SSE Data Chunk:")
+              {[data], task}
+          after
+            15_000 ->
+              {:halt, task}
+          end
+        end,
+        fn task -> Task.await(task) end
+      )
+      |> SSEStreamParser.parse()
+      |> Stream.map(fn chunk ->
+        # IO.inspect(chunk, label: "Parsed SSE Chunk (pre-parse_stream_chunk_for_mode):")
+        parse_stream_chunk_for_mode(mode, chunk)
+      end)
+      # |> IO.inspect(label: "Stream Pipeline Constructed")
   end
 
   defp do_chat_completion(mode, params, config) do
@@ -353,7 +395,7 @@ defmodule Instructor.Adapters.Gemini do
   @impl true
   defdelegate reask_messages(raw_response, params, config), to: Adapters.OpenAI
 
-  defp url(config), do: api_url(config) <> ":api_version/models/:model"
+  defp url(config), do: api_url(config)
   defp api_url(config), do: Keyword.fetch!(config, :api_url)
   defp api_key(config), do: Keyword.fetch!(config, :api_key)
   defp api_version(config), do: Keyword.fetch!(config, :api_version)
