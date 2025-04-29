@@ -146,13 +146,8 @@ defmodule Instructor.Adapters.Gemini do
     {model, params} = Map.pop!(params, :model)
     {_, params} = Map.pop!(params, :stream)
 
-    # Construct the correct URL directly
-    version = api_version(config)
-    base_url = String.trim_trailing(api_url(config), "/") # Ensure no trailing slash
-    method = :streamGenerateContent
-    # Extract only the model name part (e.g., gemini-2.0-flash-lite)
-    model_name = model |> String.split("/") |> List.last()
-    stream_url = "#{base_url}/#{version}/models/#{model_name}:#{method}?alt=sse"
+    # Construct the correct URL directly using the helper
+    stream_url = build_gemini_url(config, model, :streamGenerateContent, stream: true)
 
     stream =
       Stream.resource(
@@ -216,14 +211,17 @@ defmodule Instructor.Adapters.Gemini do
   defp do_chat_completion(mode, params, config) do
     {model, params} = Map.pop!(params, :model)
 
+    # Construct the correct URL directly using the helper
+    request_url = build_gemini_url(config, model, :generateContent, stream: false)
+
     response =
       Req.merge(gemini_req(), http_options(config))
       |> Req.post(
-        url: url(config),
-        path_params: [model: model, api_version: api_version(config)],
+        url: request_url, # Use the constructed URL
+        # path_params: [model: model, api_version: api_version(config)], # Removed
         headers: %{"x-goog-api-key" => api_key(config)},
         json: params,
-        rpc_function: :generateContent
+        # rpc_function: :generateContent # Removed
       )
 
     with {:ok, %Req.Response{status: 200, body: body} = response} <- response,
@@ -397,5 +395,14 @@ defmodule Instructor.Adapters.Gemini do
     ]
 
     Keyword.merge(default_config, base_config)
+  end
+
+  defp build_gemini_url(config, model, method, opts \\ []) do
+    version = api_version(config)
+    base_url = String.trim_trailing(api_url(config), "/")
+    model_name = model |> String.split("/") |> List.last()
+    stream_param = if opts[:stream], do: "?alt=sse", else: ""
+
+    "#{base_url}/#{version}/models/#{model_name}:#{method}#{stream_param}"
   end
 end
