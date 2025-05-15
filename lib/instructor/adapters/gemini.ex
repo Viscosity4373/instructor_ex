@@ -26,6 +26,7 @@ defmodule Instructor.Adapters.Gemini do
   alias Instructor.SSEStreamParser
   alias Instructor.Adapters
   alias Instructor.JSONSchema
+  require Logger
 
   @supported_modes [:json, :json_schema]
 
@@ -164,57 +165,82 @@ defmodule Instructor.Adapters.Gemini do
     {model, params} = Map.pop!(params, :model)
     {_, params} = Map.pop!(params, :stream)
 
-    Stream.resource(
-      fn ->
-        Task.async(fn ->
-          options =
-            Keyword.merge(options,
-              url: url(config) <> "?alt=sse",
-              path_params: [model: model, api_version: api_version(config)],
-              headers: %{"x-goog-api-key" => api_key(config)},
-              json: params,
-              rpc_function: :streamGenerateContent,
-              into: fn {:data, data}, {req, resp} ->
-                send(pid, data)
-                {:cont, {req, resp}}
-              end
-            )
+    # Construct the correct URL directly using the helper
+    stream_url = build_gemini_url(config, model, :streamGenerateContent, stream: true)
 
-          Req.merge(gemini_req(), options)
-          |> Req.post!()
+    stream =
+      Stream.resource(
+        fn ->
+          Task.async(fn ->
+            options =
+              Keyword.merge(options,
+                url: stream_url,
+                headers: %{"x-goog-api-key" => api_key(config)},
+                json: params,
+                into: fn {:data, data}, {req, resp} ->
+                  send(pid, data)
+                  {:cont, {req, resp}}
+                end
+              )
 
-          send(pid, :done)
-        end)
-      end,
-      fn task ->
-        receive do
-          :done ->
-            {:halt, task}
+            try do
+              # Use the constructed stream_url directly, remove path_params and rpc_function
+              request_options = 
+                Keyword.merge(options,
+                  # path_params: [model: model, api_version: api_version(config)], # Removed
+                  headers: %{"x-goog-api-key" => api_key(config)},
+                  json: params,
+                  # rpc_function: :streamGenerateContent, # Removed
+                  into: fn {:data, data}, {req, resp} ->
+                    send(pid, data)
+                    {:cont, {req, resp}}
+                  end
+                )
+              
+              request = Req.merge(gemini_req(), request_options)
 
-          data ->
-            {[data], task}
-        after
-          15_000 ->
-            {:halt, task}
-        end
-      end,
-      fn task -> Task.await(task) end
-    )
-    |> SSEStreamParser.parse()
-    |> Stream.map(fn chunk -> parse_stream_chunk_for_mode(mode, chunk) end)
+              response = Req.post!(request)
+            rescue
+              e -> Logger.error("Req.post! Error in Gemini streaming Task: #{inspect(e)}")
+            end
+
+            send(pid, :done)
+          end)
+        end,
+        fn task ->
+          receive do
+            :done ->
+              {:halt, task}
+
+            data ->
+              {[data], task}
+          after
+            15_000 ->
+              {:halt, task}
+          end
+        end,
+        fn task -> Task.await(task) end
+      )
+      |> SSEStreamParser.parse()
+      |> Stream.map(fn chunk ->
+        parse_stream_chunk_for_mode(mode, chunk)
+      end)
   end
 
   defp do_chat_completion(mode, params, config) do
     {model, params} = Map.pop!(params, :model)
 
+    # Construct the correct URL directly using the helper
+    request_url = build_gemini_url(config, model, :generateContent, stream: false)
+
     response =
       Req.merge(gemini_req(), http_options(config))
       |> Req.post(
-        url: url(config),
-        path_params: [model: model, api_version: api_version(config)],
+        url: request_url, # Use the constructed URL
+        # path_params: [model: model, api_version: api_version(config)], # Removed
         headers: %{"x-goog-api-key" => api_key(config)},
         json: params,
-        rpc_function: :generateContent
+        # rpc_function: :generateContent # Removed
       )
 
     with {:ok, %Req.Response{status: 200, body: body} = response} <- response,
@@ -400,7 +426,7 @@ defmodule Instructor.Adapters.Gemini do
   @impl true
   defdelegate reask_messages(raw_response, params, config), to: Adapters.OpenAI
 
-  defp url(config), do: api_url(config) <> ":api_version/models/:model"
+  defp url(config), do: api_url(config)
   defp api_url(config), do: Keyword.fetch!(config, :api_url)
   defp api_key(config), do: Keyword.fetch!(config, :api_key)
   defp api_version(config), do: Keyword.fetch!(config, :api_version)
@@ -416,5 +442,14 @@ defmodule Instructor.Adapters.Gemini do
     ]
 
     Keyword.merge(default_config, base_config)
+  end
+
+  defp build_gemini_url(config, model, method, opts \\ []) do
+    version = api_version(config)
+    base_url = String.trim_trailing(api_url(config), "/")
+    model_name = model |> String.split("/") |> List.last()
+    stream_param = if opts[:stream], do: "?alt=sse", else: ""
+
+    "#{base_url}/#{version}/models/#{model_name}:#{method}#{stream_param}"
   end
 end
