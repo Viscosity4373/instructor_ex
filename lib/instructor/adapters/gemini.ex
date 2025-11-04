@@ -219,7 +219,7 @@ defmodule Instructor.Adapters.Gemini do
               {:halt, task}
           end
         end,
-        fn task -> Task.await(task) end
+        fn task -> Task.await(task, 60_000) end
       )
       |> SSEStreamParser.parse()
       |> Stream.map(fn chunk ->
